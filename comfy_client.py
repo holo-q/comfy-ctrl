@@ -7,6 +7,7 @@ import math
 import threading
 import time
 import traceback
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -230,27 +231,39 @@ class ComfyClient:
                     raise ValueError(f"Unexpected response type: {type(ret)}")
 
     async def _make_request(
-        self, 
-        method: str, 
-        url: str, 
+        self,
+        method: str,
+        url: str,
         data: Optional[dict] = None,
         files: Optional[Mapping[str, Union[BinaryIO, tuple[Optional[str], BinaryIO, str]]]] = None,
         verbose: bool = False
     ) -> Union[Dict[str, Any], np.ndarray]:
-        """Make request with automatic reconnection"""
+        """Make request with automatic reconnection on transient errors.
+
+        Only retries on connection failures and 5xx server errors.
+        HTTP 4xx (client errors like prompt validation failures) are raised
+        immediately — retrying an invalid request achieves nothing but spam.
+        """
         while True:
             try:
                 await self.ensure_connection_async(require_uiapi='uiapi' in url)
                 return await self._make_request_once(method, url, data, files, verbose)
-            except Exception as e:
-                log.error(f"""[red]Request failed:[/red]
-                    Method: {method}
-                    URL: {url}
-                    Error: {str(e)}
-                    Retrying...""")
-                traceback.print_exc()
+            except urllib.error.HTTPError as e:
+                # 4xx = client error (bad prompt, missing fields, etc.) — don't retry
+                if 400 <= e.code < 500:
+                    body = e.read().decode("utf-8", errors="replace")
+                    log.error(f"[red]HTTP {e.code} from {url}:[/red] {body[:500]}")
+                    raise ValueError(f"ComfyUI rejected request ({e.code}): {body[:500]}") from e
+                # 5xx = server error — transient, retry after backoff
+                log.warning(f"[yellow]HTTP {e.code} from {url}, retrying...[/yellow]")
+                await asyncio.sleep(2)
+            except (ConnectionError, OSError, urllib.error.URLError) as e:
+                log.warning(f"[yellow]Connection error ({url}): {e} — retrying...[/yellow]")
                 self._webui_ready = False
-                continue
+                await asyncio.sleep(2)
+            except Exception as e:
+                log.error(f"[red]Unexpected error in request to {url}:[/red] {e}")
+                raise
 
     @classmethod
     def ConnectNew(
