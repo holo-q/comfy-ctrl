@@ -149,7 +149,8 @@ class ComfyClient:
                         response = await self._make_request_once(
                             "GET", "/uiapi/connection_status"
                         )
-                        if not response.get("webui_connected"):
+                        # API returns active_clients count and main_webui_id
+                        if not response.get("main_webui_id"):
                             raise ConnectionError("WebUI not connected")
 
                     # Check/establish WebSocket connection
@@ -341,7 +342,7 @@ class ComfyClient:
                             got_execution_status = True
                         elif got_execution_status:
                             log.info(f"[green]Execution completed[/green] in {elapsed:.1f}s")
-                            pass
+                            return
                             
                     elif msg_type == "execution_start":
                         prompt_id = msg["data"]["prompt_id"]
@@ -369,8 +370,8 @@ class ComfyClient:
                         log.info(f"[cyan]({node})[/cyan] step {value}/{max_val}")
                             
                     elif msg_type == "execution_success":
-                        # log.info(f"[green]Execution completed[/green] in {elapsed:.1f}s")
-                        pass
+                        log.info(f"[green]Execution succeeded[/green] in {elapsed:.1f}s")
+                        return
                         
                     elif msg_type.startswith("crystools"):
                         continue
@@ -670,7 +671,7 @@ class ComfyClient:
         log.info("query_fields")
         log.info(f"client_id: {self.client_id}")
 
-        response = self.json_post_async("/uiapi/query_fields", verbose=verbose)
+        response = await self.json_post_async("/uiapi/query_fields", verbose=verbose)
 
         log.info(f"query_fields response: {response}")
         log.info(response)
@@ -1048,7 +1049,7 @@ class ComfyClient:
             return self.run_sync(self.json_get_async("/uiapi/connection_status"))
         except Exception as e:
             log.error(f"Error checking connection status: {e}")
-            return {"status": "error", "error": str(e), "webui_connected": False}
+            return {"status": "error", "error": str(e), "main_webui_id": None}
 
     @property
     def is_webui_ready(self) -> bool:
@@ -1065,16 +1066,411 @@ class ComfyClient:
         self._webui_check_interval = max(0.1, interval)  # Minimum 100ms
 
     @staticmethod
-    def find_output_node(json_object) -> Optional[str]:
-        """Find the SaveImage node in the workflow"""
-        for key, value in json_object.items():
-            if isinstance(value, dict):
-                if value.get("class_type") in ["SaveImage", "Image Save"]:
-                    return key
-                result = ComfyClient.find_output_node(value)
-                if result:
-                    return result
+    def _extract_api_nodes(workflow_response: dict) -> Optional[dict]:
+        """Extract API-format node dict from a get_workflow response.
+
+        The response from get_workflow() nests the API format at
+        response["workflow"]["output"]. This helper navigates that structure,
+        with a fallback for when the dict is already in API format.
+        """
+        if not isinstance(workflow_response, dict):
+            return None
+
+        # Primary path: get_workflow() wraps graphToPrompt() output
+        wf = workflow_response.get("workflow")
+        if isinstance(wf, dict):
+            output = wf.get("output")
+            if isinstance(output, dict):
+                return output
+
+        # Fallback: already in API format (top-level keys are node IDs)
+        if any(isinstance(v, dict) and "class_type" in v
+               for v in workflow_response.values()):
+            return workflow_response
+
         return None
+
+    # Class types that produce output images in ComfyUI.
+    # Kept broad — custom nodes often name their savers creatively.
+    IMAGE_OUTPUT_CLASS_TYPES = {"SaveImage", "Image Save", "PreviewImage",
+                                "SaveImageWebsocket", "SaveAnimatedWEBP",
+                                "SaveAnimatedPNG"}
+
+    @staticmethod
+    def _is_output_node(node: dict) -> bool:
+        """Check if a node is an image output node, by class_type or title.
+
+        Matches known output class types, plus any node whose title contains
+        'save' or 'preview' (case-insensitive) — catches renamed nodes and
+        custom save nodes that follow common naming conventions.
+        """
+        class_type = node.get("class_type", "")
+        if class_type in ComfyClient.IMAGE_OUTPUT_CLASS_TYPES:
+            return True
+        title = node.get("_meta", {}).get("title", "").lower()
+        return any(kw in title for kw in ("save", "preview", "output image"))
+
+    @staticmethod
+    def extract_workflow_from_png(image_path: str) -> dict:
+        """Extract API-format workflow embedded in a ComfyUI-generated PNG.
+
+        ComfyUI stores the full API-format workflow (the same JSON you'd POST
+        to /prompt) in the PNG tEXt chunk under the key "prompt". This lets
+        any generated image carry its own reproduction recipe.
+
+        Args:
+            image_path: Path to a PNG file generated by ComfyUI.
+
+        Returns:
+            The API-format workflow dict (node IDs → {class_type, inputs}).
+
+        Raises:
+            ValueError: If the PNG has no embedded workflow metadata.
+            FileNotFoundError: If image_path doesn't exist.
+        """
+        img = Image.open(image_path)
+        raw = img.info.get("prompt")
+        if not raw:
+            # Some ComfyUI versions store it under "workflow" instead
+            raw = img.info.get("workflow")
+        if not raw:
+            raise ValueError(
+                f"No embedded ComfyUI workflow found in {image_path}. "
+                "Only PNGs generated by ComfyUI contain workflow metadata."
+            )
+        workflow = json.loads(raw)
+        # If it's a UI-format workflow (has "nodes" key), we can't use it
+        # directly — we need the API format with class_type/inputs.
+        if "nodes" in workflow and "class_type" not in workflow:
+            raise ValueError(
+                f"PNG contains a UI-format workflow, not API format. "
+                "Re-export from ComfyUI with 'Save (API format)' enabled."
+            )
+        return workflow
+
+    # -----------------------------------------------------------------------
+    # Workflow graph tracing — structural prompt detection
+    #
+    # The key insight: prompt text lives in text-encoding nodes, but those
+    # nodes can be arbitrarily far from the KSampler in the graph. Between
+    # them sit conditioning combiners, ControlNet applies, area/mask setters,
+    # etc. We must trace backward through the entire conditioning chain to
+    # find the actual text sources.
+    #
+    # Whether a text node is "positive" or "negative" is determined purely
+    # by which KSampler input it feeds into — not by any property of the
+    # text node itself.
+    # -----------------------------------------------------------------------
+
+    # Sampler nodes — the starting point for conditioning traces.
+    KSAMPLER_CLASS_TYPES = {"KSampler", "KSamplerAdvanced", "SamplerCustom"}
+
+    # Input field names that hold prompt text on text-encoding nodes.
+    # Covers standard CLIP, SDXL (text_g/text_l), and common custom nodes.
+    TEXT_INPUT_FIELDS = ("text", "text_g", "text_l", "prompt")
+
+    # Node types that are NOT part of conditioning chains. Tracing stops here
+    # to avoid false positives (e.g. ckpt_name strings on loaders) and
+    # infinite walks into unrelated subgraphs.
+    _TRACE_STOP_TYPES = frozenset({
+        # Samplers — don't re-enter the sampler we came from
+        "KSampler", "KSamplerAdvanced", "SamplerCustom", "SamplerCustomAdvanced",
+        # Model/checkpoint loaders — have string fields (ckpt_name) that aren't prompts
+        "CheckpointLoaderSimple", "CheckpointLoader", "unCLIPCheckpointLoader",
+        "UNETLoader",
+        # CLIP/VAE loaders
+        "CLIPLoader", "DualCLIPLoader", "TripleCLIPLoader", "VAELoader",
+        # LoRA loaders — have string fields (lora_name) that aren't prompts
+        "LoraLoader", "LoraLoaderModelOnly",
+        # Latent/image space — not conditioning
+        "EmptyLatentImage", "VAEDecode", "VAEEncode",
+        "LoadImage", "LoadImageMask", "SaveImage", "PreviewImage",
+    })
+
+    @staticmethod
+    def _trace_conditioning_to_text(
+        workflow: dict,
+        node_id: str,
+        _visited: Optional[set] = None,
+    ) -> list[tuple[str, str, str]]:
+        """Walk backward from a conditioning node to find text-encoding sources.
+
+        Starting at node_id, checks for text input fields (text, text_g, text_l,
+        prompt). If found, returns them — these are the terminal text sources.
+        Otherwise follows ALL connection-type inputs upstream recursively,
+        walking through conditioning combiners, ControlNet applies, area setters,
+        and any other intermediate nodes until hitting text or a stop-type.
+
+        This handles arbitrarily deep conditioning chains:
+            KSampler.positive → ControlNetApply → ConditioningCombine → CLIPTextEncode
+
+        Returns:
+            List of (node_id, field_name, current_value) for each text input found.
+            E.g. [("6", "text", "a beautiful cat"), ("8", "text_g", "landscape")]
+        """
+        if _visited is None:
+            _visited = set()
+        if node_id in _visited:
+            return []
+        _visited.add(node_id)
+
+        node = workflow.get(node_id)
+        if not isinstance(node, dict):
+            return []
+
+        class_type = node.get("class_type", "")
+        if class_type in ComfyClient._TRACE_STOP_TYPES:
+            return []
+
+        inputs = node.get("inputs", {})
+
+        # Check if this node has text inputs — it's a text encoder
+        found = []
+        for field in ComfyClient.TEXT_INPUT_FIELDS:
+            val = inputs.get(field)
+            if isinstance(val, str):
+                found.append((node_id, field, val))
+
+        if found:
+            return found  # Terminal: this node is a text source
+
+        # Not a text node — trace upstream through connection inputs.
+        # Connections in API format are [node_id_str, output_slot_index].
+        results = []
+        for input_val in inputs.values():
+            if isinstance(input_val, list) and len(input_val) == 2:
+                src_id = str(input_val[0])
+                results.extend(
+                    ComfyClient._trace_conditioning_to_text(workflow, src_id, _visited)
+                )
+        return results
+
+    # Node types that directly hold a prompt and generate images (non-diffusion).
+    # These are "terminal" generation nodes — the prompt lives on them, not
+    # upstream in a separate text-encoding node.
+    PROMPT_GENERATOR_TYPES = frozenset({
+        "GeminiImage2Node",
+    })
+
+    # Node types that act as LLM text generators whose output may feed a prompt.
+    LLM_TYPES = frozenset({
+        "LLM",
+    })
+
+    @staticmethod
+    def extract_prompts(workflow: dict) -> dict[str, str]:
+        """Extract prompt text from a workflow, regardless of pipeline type.
+
+        Handles three patterns:
+        1. **Diffusion** (KSampler) — traces conditioning graph backward to
+           find CLIPTextEncode nodes. Returns positive/negative.
+        2. **Multimodal generators** (GeminiImage2Node) — reads the `prompt`
+           field directly. If the prompt is a connection from an LLM node,
+           reads the LLM's `user_prompt` instead.
+        3. **LLM-scaffolded** — follows the prompt connection back to the
+           LLM node and extracts `user_prompt` and `system_prompt`.
+
+        Returns:
+            {"positive": "...", "negative": "..."} or {"prompt": "..."}.
+            Missing/empty values are omitted.
+        """
+        result: Dict[str, str] = {}
+
+        # --- Strategy 1: KSampler → trace conditioning to text nodes ---
+        for node_id, node in workflow.items():
+            if not isinstance(node, dict):
+                continue
+            if node.get("class_type") not in ComfyClient.KSAMPLER_CLASS_TYPES:
+                continue
+
+            inputs = node.get("inputs", {})
+            for cond_input, result_key in [("positive", "positive"), ("negative", "negative")]:
+                conn = inputs.get(cond_input)
+                if not isinstance(conn, list) or len(conn) != 2:
+                    continue
+                text_nodes = ComfyClient._trace_conditioning_to_text(
+                    workflow, str(conn[0])
+                )
+                if text_nodes:
+                    texts = []
+                    seen: set[str] = set()
+                    for _, _, val in text_nodes:
+                        if val and val not in seen:
+                            seen.add(val)
+                            texts.append(val)
+                    if texts:
+                        result[result_key] = " | ".join(texts)
+            if result:
+                return result  # Found via KSampler, done
+            break
+
+        # --- Strategy 2: Direct prompt on generator nodes (Gemini, etc.) ---
+        for node_id, node in workflow.items():
+            if not isinstance(node, dict):
+                continue
+            if node.get("class_type") not in ComfyClient.PROMPT_GENERATOR_TYPES:
+                continue
+
+            inputs = node.get("inputs", {})
+            prompt_val = inputs.get("prompt")
+
+            if isinstance(prompt_val, str) and prompt_val:
+                # Prompt is a literal string on the node
+                result["prompt"] = prompt_val
+            elif isinstance(prompt_val, list) and len(prompt_val) == 2:
+                # Prompt is a connection — trace to the source (likely an LLM node)
+                src_id = str(prompt_val[0])
+                src_node = workflow.get(src_id)
+                if isinstance(src_node, dict):
+                    src_inputs = src_node.get("inputs", {})
+                    # LLM nodes have user_prompt / system_prompt
+                    user_prompt = src_inputs.get("user_prompt")
+                    if isinstance(user_prompt, str) and user_prompt:
+                        result["prompt"] = user_prompt
+
+            if result:
+                return result
+            break
+
+        return result
+
+    @staticmethod
+    def analyze_workflow_fields(workflow: dict) -> dict:
+        """Map convenience parameter names to their concrete field paths.
+
+        Walks an API-format workflow to discover which nodes correspond to
+        common generation parameters (prompt text, seed, steps, cfg, dimensions).
+        Uses recursive graph tracing to follow conditioning chains of any depth
+        back to text-encoding nodes.
+
+        The returned dict maps semantic names → "node_id.input_name" paths
+        suitable for passing to execute_workflow_async(fields=...).
+
+        Example return:
+            {
+                "positive_prompt": "6.text",
+                "negative_prompt": "7.text",
+                "seed": "3.seed",
+                "steps": "3.steps",
+                "cfg": "3.cfg",
+                "width": "5.width",
+                "height": "5.height",
+            }
+
+        Missing mappings are simply omitted (e.g. no EmptyLatentImage → no width/height).
+        """
+        field_map: Dict[str, str] = {}
+
+        # --- Find KSampler node ---
+        ksampler_id = None
+        ksampler_node = None
+        for node_id, node in workflow.items():
+            if not isinstance(node, dict):
+                continue
+            if node.get("class_type") in ComfyClient.KSAMPLER_CLASS_TYPES:
+                ksampler_id = node_id
+                ksampler_node = node
+                break
+
+        if not ksampler_node:
+            return field_map
+
+        inputs = ksampler_node.get("inputs", {})
+
+        # Direct scalar fields on KSampler
+        for param in ("seed", "steps", "cfg"):
+            if param in inputs:
+                field_map[param] = f"{ksampler_id}.{param}"
+
+        # --- Trace conditioning chains to text-encoding nodes ---
+        for cond_input, semantic_key in [("positive", "positive_prompt"), ("negative", "negative_prompt")]:
+            conn = inputs.get(cond_input)
+            if not isinstance(conn, list) or len(conn) != 2:
+                continue
+            text_nodes = ComfyClient._trace_conditioning_to_text(
+                workflow, str(conn[0])
+            )
+            if text_nodes:
+                # Primary text field → the convenience param target
+                node_id, field, _ = text_nodes[0]
+                field_map[semantic_key] = f"{node_id}.{field}"
+
+        # --- Trace latent_image connection to EmptyLatentImage ---
+        latent_conn = inputs.get("latent_image")
+        if isinstance(latent_conn, list) and len(latent_conn) == 2:
+            latent_id = str(latent_conn[0])
+            latent_node = workflow.get(latent_id)
+            if isinstance(latent_node, dict) and latent_node.get("class_type") == "EmptyLatentImage":
+                latent_inputs = latent_node.get("inputs", {})
+                if "width" in latent_inputs:
+                    field_map["width"] = f"{latent_id}.width"
+                if "height" in latent_inputs:
+                    field_map["height"] = f"{latent_id}.height"
+
+        return field_map
+
+    @staticmethod
+    def find_output_node(json_object) -> Optional[str]:
+        """Find the most downstream image output node in the workflow.
+
+        Instead of returning the first SaveImage encountered, this computes
+        the topological depth of every node and returns the deepest output
+        node. In a typical workflow that means the final save after all
+        upscaling, refinement, and post-processing — not an intermediate
+        checkpoint save.
+        """
+        api_nodes = ComfyClient._extract_api_nodes(json_object)
+        if not api_nodes:
+            # Legacy fallback: recursive search for any SaveImage
+            for key, value in json_object.items():
+                if isinstance(value, dict):
+                    if value.get("class_type") in ComfyClient.IMAGE_OUTPUT_CLASS_TYPES:
+                        return key
+                    result = ComfyClient.find_output_node(value)
+                    if result:
+                        return result
+            return None
+
+        # Identify all output nodes
+        output_nodes = [nid for nid, node in api_nodes.items()
+                        if isinstance(node, dict) and ComfyClient._is_output_node(node)]
+
+        if not output_nodes:
+            return None
+        if len(output_nodes) == 1:
+            return output_nodes[0]
+
+        # Build forward adjacency from connections in the API format.
+        # Input values of shape [node_id_str, slot_index] are connections.
+        children: dict[str, list[str]] = {nid: [] for nid in api_nodes}
+        in_degree: dict[str, int] = {nid: 0 for nid in api_nodes}
+
+        for nid, node in api_nodes.items():
+            if not isinstance(node, dict):
+                continue
+            for input_val in node.get("inputs", {}).values():
+                if isinstance(input_val, list) and len(input_val) == 2:
+                    src_id = str(input_val[0])
+                    if src_id in api_nodes:
+                        children[src_id].append(nid)
+                        in_degree[nid] += 1
+
+        # Kahn's algorithm: topological sort + compute depth per node.
+        # depth[n] = max(depth[predecessor] + 1) for all predecessors.
+        from collections import deque
+        depths: dict[str, int] = {nid: 0 for nid in api_nodes}
+        queue = deque(nid for nid, deg in in_degree.items() if deg == 0)
+
+        while queue:
+            nid = queue.popleft()
+            for child in children[nid]:
+                depths[child] = max(depths[child], depths[nid] + 1)
+                in_degree[child] -= 1
+                if in_degree[child] == 0:
+                    queue.append(child)
+
+        # Return the deepest output node — the true final result.
+        return max(output_nodes, key=lambda nid: depths.get(nid, 0))
 
     async def upload_image(
         self, 

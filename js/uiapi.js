@@ -3,6 +3,7 @@ import { connectionManager } from "./services/ConnectionManager.js";
 import { registerApiHandlers } from "./services/ApiHandlers.js";
 import { selectNodeAt } from "./utils/nodeUtils.js";
 import { RENAME_DEFAULTS } from "./config/constants.js";
+import { showMCPInstallDialog } from "./components/MCPInstallDialog.js";
 
 let lastClickTime = null;
 let lastRenameValue = "";
@@ -157,6 +158,39 @@ app.registerExtension({
         });
 
         window.addEventListener("keyup", handleKeyEvent);
+
+        // MCP Install button — one-click config for Claude Desktop/Code
+        const mcpButton = document.createElement('button');
+        mcpButton.textContent = 'MCP';
+        mcpButton.title = 'Install MCP server for Claude Desktop / Claude Code';
+        mcpButton.style.cssText = `
+            position: fixed;
+            bottom: 10px;
+            right: 10px;
+            z-index: 9999;
+            background: rgba(45, 45, 45, 0.9);
+            border: 1px solid #555;
+            color: #ccc;
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: bold;
+            backdrop-filter: blur(4px);
+            transition: all 0.2s;
+        `;
+        mcpButton.onmouseover = () => {
+            mcpButton.style.borderColor = '#2ecc71';
+            mcpButton.style.color = '#fff';
+            mcpButton.style.background = 'rgba(46, 204, 113, 0.15)';
+        };
+        mcpButton.onmouseout = () => {
+            mcpButton.style.borderColor = '#555';
+            mcpButton.style.color = '#ccc';
+            mcpButton.style.background = 'rgba(45, 45, 45, 0.9)';
+        };
+        mcpButton.onclick = () => showMCPInstallDialog();
+        document.body.appendChild(mcpButton);
 
         console.log("[UIAPI] ✓ Setup completed successfully");
     }

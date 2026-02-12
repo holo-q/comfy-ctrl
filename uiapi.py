@@ -1321,3 +1321,186 @@ async def uiapi_clear_nonexistant_models(request):
         log.error(f"Error clearing non-existent models: {e}")
         log.error(traceback.format_exc())
         return web.json_response({"status": "error", "error": str(e)}, status=500)
+
+
+@routes.get("/uiapi/mcp_status")
+async def uiapi_mcp_status(request):
+    """Check current MCP installation status across all supported targets.
+
+    Inspects Claude Desktop and Claude Code config files to determine whether
+    the comfyui MCP server entry is present, without modifying anything.
+    """
+    try:
+        import platform as plat
+
+        plugin_path = str(Path(__file__).resolve().parent)
+        system = plat.system()
+
+        # Build target configs based on detected platform
+        if system == "Linux":
+            target_configs = {
+                "claude_desktop": Path("~/.config/Claude/claude_desktop_config.json").expanduser(),
+                "claude_code": Path("~/.claude.json").expanduser(),
+            }
+        elif system == "Darwin":
+            target_configs = {
+                "claude_desktop": Path("~/Library/Application Support/Claude/claude_desktop_config.json").expanduser(),
+                "claude_code": Path("~/.claude.json").expanduser(),
+            }
+        elif system == "Windows":
+            appdata = os.environ.get("APPDATA", "")
+            target_configs = {
+                "claude_desktop": Path(appdata) / "Claude" / "claude_desktop_config.json",
+                "claude_code": Path("~/.claude.json").expanduser(),
+            }
+        else:
+            target_configs = {
+                "claude_code": Path("~/.claude.json").expanduser(),
+            }
+
+        targets = {}
+        for name, config_path in target_configs.items():
+            config_exists = config_path.exists()
+            installed = False
+            if config_exists:
+                try:
+                    with open(config_path, "r") as f:
+                        config = json.load(f)
+                    installed = "comfyui" in config.get("mcpServers", {})
+                except (json.JSONDecodeError, IOError):
+                    pass
+            targets[name] = {
+                "path": str(config_path),
+                "config_exists": config_exists,
+                "installed": installed,
+            }
+
+        log.debug("-> /uiapi/mcp_status")
+        return web.json_response({
+            "status": "ok",
+            "plugin_path": plugin_path,
+            "platform": system,
+            "targets": targets,
+        })
+    except Exception as e:
+        log.error(f"Error checking MCP status: {e}")
+        log.error(traceback.format_exc())
+        return web.json_response({"status": "error", "error": str(e)}, status=500)
+
+
+@routes.post("/uiapi/install_mcp")
+async def uiapi_install_mcp(request):
+    """Write MCP server config into Claude Desktop and/or Claude Code config files.
+
+    Merges the comfyui MCP server entry into each target's JSON config,
+    creating parent directories and the file itself if they don't exist.
+    Accepts an optional JSON body with {targets: ["claude_desktop", "claude_code"]}
+    to limit which configs are written (defaults to all detected targets).
+    """
+    try:
+        import platform as plat
+
+        # Parse optional request body for target filtering
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        requested_targets = body.get("targets", None)
+
+        plugin_path = str(Path(__file__).resolve().parent)
+
+        # Detect ComfyUI address from the running PromptServer instance
+        address = getattr(PromptServer.instance, "address", "127.0.0.1")
+        port = getattr(PromptServer.instance, "port", 8188)
+        comfyui_address = f"{address}:{port}"
+
+        # The MCP server entry we want to install
+        mcp_entry = {
+            "command": "uvx",
+            "args": ["--from", plugin_path, "comfyui-mcp-uiapi"],
+            "env": {"COMFYUI_ADDRESS": comfyui_address},
+        }
+
+        system = plat.system()
+
+        # Build target configs based on detected platform (same logic as mcp_status)
+        if system == "Linux":
+            target_configs = {
+                "claude_desktop": Path("~/.config/Claude/claude_desktop_config.json").expanduser(),
+                "claude_code": Path("~/.claude.json").expanduser(),
+            }
+        elif system == "Darwin":
+            target_configs = {
+                "claude_desktop": Path("~/Library/Application Support/Claude/claude_desktop_config.json").expanduser(),
+                "claude_code": Path("~/.claude.json").expanduser(),
+            }
+        elif system == "Windows":
+            appdata = os.environ.get("APPDATA", "")
+            target_configs = {
+                "claude_desktop": Path(appdata) / "Claude" / "claude_desktop_config.json",
+                "claude_code": Path("~/.claude.json").expanduser(),
+            }
+        else:
+            target_configs = {
+                "claude_code": Path("~/.claude.json").expanduser(),
+            }
+
+        # Filter to only requested targets if specified
+        if requested_targets is not None:
+            target_configs = {
+                k: v for k, v in target_configs.items() if k in requested_targets
+            }
+
+        results = {}
+        for name, config_path in target_configs.items():
+            try:
+                # Read existing config or start fresh
+                if config_path.exists():
+                    with open(config_path, "r") as f:
+                        config = json.load(f)
+                else:
+                    config = {}
+
+                # Check if already installed with the exact same config
+                existing_entry = config.get("mcpServers", {}).get("comfyui")
+                if existing_entry == mcp_entry:
+                    results[name] = {"status": "already_installed", "path": str(config_path)}
+                    continue
+
+                # Determine if this is a fresh install or an update
+                result_status = "updated" if existing_entry is not None else "installed"
+
+                # Merge the MCP entry into the config
+                if "mcpServers" not in config:
+                    config["mcpServers"] = {}
+                config["mcpServers"]["comfyui"] = mcp_entry
+
+                # Ensure parent directories exist
+                config_path.parent.mkdir(parents=True, exist_ok=True)
+
+                # Write back the config
+                with open(config_path, "w") as f:
+                    json.dump(config, f, indent=2)
+
+                results[name] = {"status": result_status, "path": str(config_path)}
+                log.info(f"MCP config {result_status} for {name} at {config_path}")
+
+            except Exception as target_err:
+                log.error(f"Error installing MCP for target {name}: {target_err}")
+                results[name] = {
+                    "status": "error",
+                    "path": str(config_path),
+                    "error": str(target_err),
+                }
+
+        log.debug("-> /uiapi/install_mcp")
+        return web.json_response({
+            "status": "ok",
+            "plugin_path": plugin_path,
+            "comfyui_address": comfyui_address,
+            "results": results,
+        })
+    except Exception as e:
+        log.error(f"Error installing MCP config: {e}")
+        log.error(traceback.format_exc())
+        return web.json_response({"status": "error", "error": str(e)}, status=500)
