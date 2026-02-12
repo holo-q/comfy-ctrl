@@ -33,10 +33,15 @@ log = logging.getLogger("comfyui-mcp")
 # ---------------------------------------------------------------------------
 mcp = FastMCP(
     "comfyui",
-    instructions="Control ComfyUI image generation. Use generate_image as the "
-    "primary tool — it builds and executes workflows in one call. Routes "
-    "(gemini, diffusion) construct workflows dynamically; templates store "
-    "reusable static workflows. Use list_routes to see what's available.",
+    instructions=(
+        "IMPORTANT: To generate images, call generate_image directly with a prompt. "
+        "Do NOT call check_status or list_routes first — generate_image handles "
+        "everything in one call. The 'model' parameter selects the API provider "
+        "(default: gemini). Examples: model='openai', model='grok', model='flux'. "
+        "Use route='diffusion' for local Stable Diffusion checkpoints. "
+        "Only use other tools (query_fields, set_fields, etc.) for advanced "
+        "browser-based workflow manipulation."
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -70,6 +75,249 @@ async def get_client(require_uiapi=False):
     _client = client
     log.info(f"ComfyUI client ready (address={address})")
     return _client
+
+
+# ---------------------------------------------------------------------------
+# API Provider Discovery — introspects ComfyUI's /object_info at runtime to
+# find all installed API image generation nodes (Gemini, OpenAI, Grok, Flux,
+# Stability, Ideogram, Kling, Luma, etc.). The model parameter on
+# generate_image selects the provider; no hardcoded route per vendor.
+# ---------------------------------------------------------------------------
+
+_provider_cache: Optional[dict] = None
+_provider_cache_time: float = 0.0
+_PROVIDER_CACHE_TTL = 300.0  # 5 min — /object_info is expensive
+
+
+class ApiProvider:
+    """Descriptor for a discovered API image generation provider.
+
+    Built by introspecting a ComfyUI node's /object_info schema. Normalizes
+    the heterogeneous input names (model vs model_name, image vs images,
+    aspect_ratio vs ratio vs size_preset) into a uniform interface that
+    _build_api_workflow can consume.
+    """
+    __slots__ = (
+        "name",           # e.g. "gemini", "openai", "grok"
+        "class_type",     # e.g. "GeminiImage2Node"
+        "models",         # available model choices from COMBO, or None
+        "image_field",    # name of image input ("images", "image", None)
+        "image_required", # whether image is required (edit-only) vs optional
+        "prompt_field",   # "prompt" (almost always)
+        "model_field",    # "model" or "model_name" or None
+        "seed_field",     # "seed" or None
+        "size_fields",    # semantic→actual field name, e.g. {"aspect_ratio": "ratio"}
+        "extra_defaults", # required inputs we don't handle → their defaults
+        "description",    # human-readable
+    )
+
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+    def __repr__(self):
+        return f"ApiProvider({self.name!r}, {self.class_type!r})"
+
+
+def _find_field(inputs: dict, candidates: tuple[str, ...]) -> Optional[str]:
+    """Return the first matching field name from candidates, or None."""
+    for name in candidates:
+        if name in inputs:
+            return name
+    return None
+
+
+def _extract_combo_options(field_spec) -> Optional[list]:
+    """Extract available options from a ComfyUI COMBO field spec.
+
+    Two formats exist in /object_info:
+      Old: [['opt1', 'opt2'], {default: ...}]     → field_spec[0] is a list
+      New: ['COMBO', {'options': ['opt1', 'opt2']}] → field_spec[0] is 'COMBO'
+    """
+    if not isinstance(field_spec, list) or not field_spec:
+        return None
+    # Old style: first element is the options list
+    if isinstance(field_spec[0], list) and field_spec[0]:
+        return field_spec[0]
+    # New style: options in the metadata dict
+    if len(field_spec) >= 2 and isinstance(field_spec[1], dict):
+        opts = field_spec[1].get("options")
+        if isinstance(opts, list) and opts:
+            return opts
+    return None
+
+
+def _extract_default(field_spec) -> Any:
+    """Extract the default value from a ComfyUI field spec.
+
+    Returns the explicit 'default' if present, or the first COMBO option,
+    or None if no default can be determined.
+    """
+    if not isinstance(field_spec, list) or len(field_spec) < 2:
+        return None
+    if isinstance(field_spec[1], dict):
+        default = field_spec[1].get("default")
+        if default is not None:
+            return default
+    # Fall back to first COMBO option
+    opts = _extract_combo_options(field_spec)
+    if opts:
+        return opts[0]
+    return None
+
+
+async def _discover_api_providers(client) -> dict[str, ApiProvider]:
+    """Query /object_info and extract all API image generation nodes.
+
+    Scans for nodes whose category matches 'api node/image/*', builds a
+    normalized ApiProvider descriptor for each. Prefers txt2img-capable nodes
+    (prompt required, image optional) over edit-only nodes when a provider
+    has multiple class_types. Results cached for _PROVIDER_CACHE_TTL seconds.
+    """
+    global _provider_cache, _provider_cache_time
+    import time
+
+    now = time.monotonic()
+    if _provider_cache is not None and (now - _provider_cache_time) < _PROVIDER_CACHE_TTL:
+        return _provider_cache
+
+    log.info("Discovering API image providers from /object_info...")
+    try:
+        object_info = await client._make_request_once("GET", "/object_info")
+    except Exception as e:
+        log.warning(f"Failed to fetch /object_info: {e}")
+        if _provider_cache is not None:
+            return _provider_cache  # stale cache > nothing
+        return {}
+
+    providers: dict[str, ApiProvider] = {}
+
+    for class_type, info in object_info.items():
+        category = info.get("category", "")
+        if not category.startswith("api node/image/"):
+            continue
+
+        provider_name = category.split("/")[-1].lower()
+        required = info.get("input", {}).get("required", {})
+        optional = info.get("input", {}).get("optional", {})
+        all_inputs = {**required, **optional}
+
+        # Identify key fields across heterogeneous naming conventions
+        prompt_field = _find_field(all_inputs, ("prompt",))
+        model_field = _find_field(all_inputs, ("model", "model_name"))
+        seed_field = _find_field(all_inputs, ("seed",))
+        image_field = _find_field(all_inputs, ("images", "image"))
+        image_required = image_field in required if image_field else False
+
+        # Must have prompt to be useful as a generation node
+        if not prompt_field:
+            continue
+
+        # Extract model choices from COMBO type — two formats exist:
+        # Old: [['opt1', 'opt2'], {default: ...}]  (field_spec[0] is list)
+        # New: ['COMBO', {'options': ['opt1', 'opt2']}]  (field_spec[0] is str)
+        models = None
+        if model_field and model_field in all_inputs:
+            models = _extract_combo_options(all_inputs[model_field])
+
+        # Detect size/dimension fields — providers use different names
+        size_fields: dict[str, str] = {}
+        for candidate in ("aspect_ratio", "ratio", "size", "size_preset", "resolution"):
+            if candidate in all_inputs:
+                size_fields["aspect_ratio"] = candidate
+                break
+        if "width" in all_inputs and "height" in all_inputs:
+            size_fields["width"] = "width"
+            size_fields["height"] = "height"
+
+        # Collect defaults for ALL required inputs — the builder fills
+        # prompt/model/seed/size explicitly, but everything else needs a
+        # sensible default or ComfyUI will reject the workflow.
+        extra_defaults: dict[str, Any] = {}
+        for fname, fspec in required.items():
+            if fname == prompt_field:
+                continue  # always set by the builder
+            default = _extract_default(fspec)
+            if default is not None:
+                extra_defaults[fname] = default
+
+        # When multiple nodes exist for the same provider, pick the most
+        # capable: txt2img > img2img-only, optional images > no images,
+        # more features (model, seed fields) > fewer.
+        if provider_name in providers:
+            existing = providers[provider_name]
+            new_score = (
+                (0 if image_required else 1) * 100  # txt2img strongly preferred
+                + (1 if image_field and not image_required else 0) * 50  # optional images
+                + (1 if model_field else 0) * 10  # has model selector
+                + (1 if seed_field else 0) * 5  # has seed
+                + len(all_inputs)  # more features
+            )
+            existing_score = (
+                (0 if existing.image_required else 1) * 100
+                + (1 if existing.image_field and not existing.image_required else 0) * 50
+                + (1 if existing.model_field else 0) * 10
+                + (1 if existing.seed_field else 0) * 5
+            )
+            if new_score <= existing_score:
+                continue  # keep existing, it's at least as good
+
+        providers[provider_name] = ApiProvider(
+            name=provider_name,
+            class_type=class_type,
+            models=models,
+            image_field=image_field,
+            image_required=image_required,
+            prompt_field=prompt_field,
+            model_field=model_field,
+            seed_field=seed_field,
+            size_fields=size_fields,
+            extra_defaults=extra_defaults,
+            description=f"{class_type} ({category})",
+        )
+
+    _provider_cache = providers
+    _provider_cache_time = now
+    log.info(f"Discovered {len(providers)} API providers: {', '.join(sorted(providers))}")
+    return providers
+
+
+def _resolve_provider(
+    providers: dict[str, ApiProvider], model: Optional[str]
+) -> ApiProvider:
+    """Resolve a model parameter to a specific ApiProvider.
+
+    Resolution order:
+    1. model=None → default (gemini if available, else first alphabetically)
+    2. model matches a provider name → that provider
+    3. model matches a model ID in some provider's list → that provider
+    4. No match → treat as model ID for the default provider
+    """
+    if not providers:
+        raise ValueError(
+            "No API image providers found. Install ComfyUI API nodes "
+            "(e.g. comfyui-api-nodes) and restart ComfyUI."
+        )
+
+    def _default():
+        return providers.get("gemini") or next(iter(sorted(providers.values(), key=lambda p: p.name)))
+
+    if model is None:
+        return _default()
+
+    # Exact provider name match (case-insensitive)
+    model_lower = model.lower()
+    if model_lower in providers:
+        return providers[model_lower]
+
+    # Search all providers' model lists for an exact model ID match
+    for provider in providers.values():
+        if provider.models and model in provider.models:
+            return provider
+
+    # Unrecognized — assume it's a specific model ID for the default provider
+    log.info(f"Model '{model}' not recognized as provider; passing to default provider as model ID")
+    return _default()
 
 
 # ===========================================================================
@@ -360,21 +608,29 @@ async def _upload_images(client, image_paths: list[str]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Route: Gemini — multimodal LLM image generation/editing
+# Route: API — auto-discovered provider image generation/editing
+#
+# Replaces the old hardcoded Gemini builder. The 'model' parameter selects
+# the provider (gemini, openai, grok, flux, stability, ideogram, etc.) via
+# _resolve_provider. The workflow graph adapts to image count: 0 = txt2img,
+# 1 = direct image input, N = LoadImage × N → BatchImagesNode → provider.
 # ---------------------------------------------------------------------------
 
-async def _build_gemini_workflow(
+async def _build_api_workflow(
     client, prompt: str, images: list[str],
     model: Optional[str] = None, **params
 ) -> dict:
-    """Build a Gemini image generation workflow.
+    """Build a workflow for any discovered API image generation provider.
 
-    0 images → generate from text prompt
-    1 image  → edit/transform with text instruction
-    N images → batch inputs, edit/transform with text instruction
+    Provider is resolved from the 'model' parameter via _resolve_provider:
+    model=None → default (gemini), model="openai" → OpenAI, etc.
     """
+    providers = await _discover_api_providers(client)
+    provider = _resolve_provider(providers, model)
+    log.info(f"Using API provider: {provider.name} ({provider.class_type})")
+
     workflow: dict[str, dict] = {}
-    nid = 1  # auto-incrementing node ID
+    nid = 1
 
     # --- Upload and create LoadImage nodes ---
     image_node_ids: list[str] = []
@@ -404,31 +660,50 @@ async def _build_gemini_workflow(
     elif len(image_node_ids) == 1:
         images_input = [image_node_ids[0], 0]
 
-    # --- GeminiImage2Node ---
-    gemini_inputs: dict[str, Any] = {
-        "prompt": prompt,
-        "model": model or "gemini-3-pro-image-preview",
-        "seed": params.get("seed", 0),
-        "aspect_ratio": params.get("aspect_ratio", "1:1"),
-        "resolution": params.get("resolution", "1K"),
-        "response_modalities": "IMAGE",
-        "system_prompt": "",
-    }
-    if images_input is not None:
-        gemini_inputs["images"] = images_input
+    # --- Build API node inputs from provider descriptor ---
+    # Start with all required defaults from /object_info, then overlay
+    # with explicit values. This ensures ComfyUI never rejects the workflow
+    # for missing required inputs.
+    api_inputs: dict[str, Any] = dict(provider.extra_defaults)
+
+    # Prompt (always present for txt2img nodes)
+    api_inputs[provider.prompt_field] = prompt
+
+    # Model selection — use explicit model ID if it's not a provider name,
+    # otherwise the default from extra_defaults is already set
+    if provider.model_field and model:
+        if model.lower() not in providers:
+            # Specific model ID passed (e.g. "gpt-image-1"), use directly
+            api_inputs[provider.model_field] = model
+
+    # Seed — override default if user provides one
+    if provider.seed_field and "seed" in params:
+        api_inputs[provider.seed_field] = params["seed"]
+
+    # Size — override defaults if user provides explicit values
+    if "aspect_ratio" in provider.size_fields and "aspect_ratio" in params:
+        api_inputs[provider.size_fields["aspect_ratio"]] = params["aspect_ratio"]
+    if "width" in provider.size_fields and "width" in params:
+        api_inputs["width"] = params["width"]
+    if "height" in provider.size_fields and "height" in params:
+        api_inputs["height"] = params["height"]
+
+    # Wire image input if provider supports it and images were provided
+    if images_input is not None and provider.image_field:
+        api_inputs[provider.image_field] = images_input
 
     workflow[str(nid)] = {
-        "class_type": "GeminiImage2Node",
-        "inputs": gemini_inputs,
-        "_meta": {"title": "Gemini Image Generation"},
+        "class_type": provider.class_type,
+        "inputs": api_inputs,
+        "_meta": {"title": f"{provider.name.title()} Image Generation"},
     }
-    gemini_id = str(nid)
+    api_node_id = str(nid)
     nid += 1
 
     # --- SaveImage ---
     workflow[str(nid)] = {
         "class_type": "SaveImage",
-        "inputs": {"filename_prefix": "ComfyUI", "images": [gemini_id, 0]},
+        "inputs": {"filename_prefix": "ComfyUI", "images": [api_node_id, 0]},
     }
 
     return workflow
@@ -507,17 +782,23 @@ async def _auto_detect_checkpoint(client) -> str:
 # ---------------------------------------------------------------------------
 
 _ROUTES: dict[str, dict] = {
+    "api": {
+        "name": "API Image Generation",
+        "description": "Generate or edit images with any installed API provider "
+                       "(Gemini, OpenAI, Grok, Flux, Stability, Ideogram, Kling, Luma, etc.). "
+                       "Provider selected via 'model' param — use provider name "
+                       "(model='openai') or specific model ID (model='gpt-image-1'). "
+                       "Default: gemini. 0 images = generate, 1+ = edit/transform.",
+        "build": _build_api_workflow,
+    },
     "gemini": {
-        "name": "Gemini Image Generation",
-        "description": "Generate or edit images with Google Gemini. "
-                       "0 images = generate from prompt. "
-                       "1+ images = edit/transform with text instruction. "
-                       "Params: model (gemini model name), seed, aspect_ratio, resolution.",
-        "build": _build_gemini_workflow,
+        "name": "Gemini (alias for api + model=gemini)",
+        "description": "Backward-compatible alias. Equivalent to route='api' with model='gemini'.",
+        "build": _build_api_workflow,
     },
     "diffusion": {
         "name": "Stable Diffusion txt2img",
-        "description": "Standard diffusion pipeline: checkpoint → CLIP → KSampler → VAE → save. "
+        "description": "Local diffusion pipeline: checkpoint → CLIP → KSampler → VAE → save. "
                        "Params: model (checkpoint filename), seed, steps, cfg, width, height, negative_prompt.",
         "build": _build_diffusion_workflow,
     },
@@ -577,21 +858,34 @@ async def save_template(
 
 @mcp.tool()
 async def list_routes() -> dict:
-    """List available generation routes and saved templates.
+    """List available generation routes, API providers, and saved templates.
 
-    Routes are dynamic workflow builders that construct the graph at runtime
-    based on your inputs (prompt, images, params). Templates are static
-    workflow snapshots with overridable fields.
+    Routes are dynamic workflow builders. API providers are auto-discovered
+    from installed ComfyUI nodes. Templates are static workflow snapshots.
 
-    Use route names with generate_image(route="gemini") and template IDs
-    with generate_image(template="my_workflow").
+    Use generate_image(prompt="...") for default provider (gemini),
+    or generate_image(prompt="...", model="openai") for a specific provider.
     """
     from comfy_client import ComfyClient
 
-    result: dict[str, Any] = {"routes": {}, "templates": {}}
+    result: dict[str, Any] = {"routes": {}, "providers": {}, "templates": {}}
 
     for rid, r in _ROUTES.items():
         result["routes"][rid] = {"name": r["name"], "description": r["description"]}
+
+    # Auto-discovered API providers from /object_info
+    try:
+        client = await get_client()
+        providers = await _discover_api_providers(client)
+        for pname, p in sorted(providers.items()):
+            result["providers"][pname] = {
+                "class_type": p.class_type,
+                "models": p.models,
+                "supports_images": p.image_field is not None,
+                "image_required": p.image_required,
+            }
+    except Exception as e:
+        result["providers_error"] = str(e)
 
     templates = _load_templates()
     for tid, t in templates.items():
@@ -642,42 +936,40 @@ async def generate_image(
 ) -> MCPImage:
     """Generate an image — the single entry point for all ComfyUI generation.
 
-    Fully headless. Three ways to specify what pipeline to run:
+    JUST CALL THIS with a prompt. No need to check_status or list_routes first.
 
-    1. **Routes** (dynamic) — build the workflow from scratch based on inputs.
-       The graph shape adapts to the number of input images.
-       generate_image(prompt="a cat", route="gemini")
-       generate_image(prompt="edit this", route="gemini", images=["/path/to/img.png"])
-       generate_image(prompt="landscape", route="diffusion", model="sd_xl.safetensors")
+    The 'model' parameter selects the API provider (auto-discovered from
+    installed ComfyUI nodes). Default: gemini.
 
-    2. **Templates** (static) — use a saved workflow snapshot, override fields.
-       generate_image(prompt="a cat", template="my_sdxl_workflow")
-
-    3. **Inline** — pass a workflow dict or a ComfyUI PNG directly.
-       generate_image(prompt="a cat", workflow={...})
-       generate_image(prompt="redo this", image_path="/outputs/ComfyUI_00042.png")
-
-    Resolution order: route > workflow > image_path > template > "gemini" default.
+    Examples:
+      generate_image(prompt="a cat")                          # default (gemini)
+      generate_image(prompt="a cat", model="openai")          # OpenAI
+      generate_image(prompt="a cat", model="grok")            # Grok
+      generate_image(prompt="a cat", model="flux")            # Flux/BFL
+      generate_image(prompt="a cat", model="stability ai")    # Stability AI
+      generate_image(prompt="edit", images=["/path.png"])      # image editing
+      generate_image(prompt="...", route="diffusion", model="sd_xl.safetensors")
 
     Args:
         prompt:           Text prompt / instruction.
-        images:           Input image paths (uploaded automatically). Routes handle
-                          variable counts — 0 for generation, 1+ for editing.
-        route:            Route name: "gemini", "diffusion" (see list_routes).
-        template:         Saved template ID (see list_routes).
+        images:           Input image paths (uploaded automatically).
+                          0 = generate, 1+ = edit/transform.
+        route:            "api" (default), "diffusion", or "gemini" (alias).
+        model:            Provider name ("gemini", "openai", "grok", "flux", ...)
+                          or specific model ID ("gpt-image-1", etc.).
+                          For diffusion: checkpoint filename.
+        template:         Saved template ID.
         workflow:         Inline API-format workflow JSON.
         image_path:       ComfyUI PNG with embedded workflow metadata.
-        model:            Model name (checkpoint for diffusion, model ID for Gemini).
-        negative_prompt:  Negative prompt (diffusion routes).
+        negative_prompt:  Negative prompt (diffusion only).
         seed:             Generation seed.
-        steps:            Sampling steps (diffusion).
-        cfg:              CFG scale (diffusion).
-        width:            Output width (diffusion).
-        height:           Output height (diffusion).
+        steps:            Sampling steps (diffusion only).
+        cfg:              CFG scale (diffusion only).
+        width:            Output width.
+        height:           Output height.
         fields:           Raw workflow field overrides {"node_id.input_name": value}.
-                          Highest priority — applied after everything else.
 
-    Returns the output image as PNG.
+    Returns the output image.
     """
     import copy
     from comfy_client import ComfyClient
@@ -698,6 +990,9 @@ async def generate_image(
         if route not in _ROUTES:
             available = ", ".join(_ROUTES.keys())
             raise ValueError(f"Route '{route}' not found. Available: {available}")
+        # Backward compat: route="gemini" implies model="gemini" if not set
+        if route == "gemini" and model is None:
+            model = "gemini"
         builder = _ROUTES[route]["build"]
         wf = await builder(client, prompt, images or [], model=model, **params)
     elif workflow is not None:
@@ -711,8 +1006,8 @@ async def generate_image(
             raise ValueError(f"Template '{template}' not found. Available: {available}")
         wf = copy.deepcopy(templates[template]["workflow"])
     else:
-        # Default: Gemini route
-        builder = _ROUTES["gemini"]["build"]
+        # Default: API route (auto-discovers provider, defaults to gemini)
+        builder = _ROUTES["api"]["build"]
         wf = await builder(client, prompt, images or [], model=model, **params)
 
     # --- For template/workflow/image_path modes: apply convenience param overrides ---
