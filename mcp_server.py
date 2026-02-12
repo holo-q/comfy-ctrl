@@ -179,12 +179,22 @@ async def connect_nodes(from_path: str, to_path: str) -> dict:
     return await client.connect_async(from_path, to_path)
 
 
+# MCP clients (Claude Desktop, etc.) enforce a 1MB tool result limit.
+# Raw PNGs from ComfyUI easily exceed this, so we compress to JPEG and
+# progressively reduce quality/size until under the cap.
+_MCP_MAX_IMAGE_BYTES = 950_000  # ~950KB, leave headroom for JSON framing
+
+
 def _numpy_to_mcp_image(result) -> MCPImage:
-    """Convert a numpy image array to an MCP-serializable PNG.
+    """Convert a numpy image array to an MCP-serializable image.
 
     The data from ComfyClient.get_image_async() is already RGB (the BGR→RGB
     conversion happens inside _make_request_once at decode time), so we
     must NOT apply another color-space swap here.
+
+    Automatically compresses to fit within MCP's 1MB tool result limit:
+    first tries JPEG at quality 90, then progressively lowers quality,
+    then downscales if still too large.
     """
     import numpy as np
     from PIL import Image
@@ -194,11 +204,30 @@ def _numpy_to_mcp_image(result) -> MCPImage:
 
     if result.dtype in [np.float32, np.float64]:
         result = (result * 255).astype(np.uint8)
-    # Data is already RGB from comfy_client — go straight to PIL
+
     img = Image.fromarray(result)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return MCPImage(data=buf.getvalue(), format="png")
+
+    # Try JPEG at decreasing quality levels
+    for quality in (90, 80, 70, 60):
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality)
+        if buf.tell() <= _MCP_MAX_IMAGE_BYTES:
+            return MCPImage(data=buf.getvalue(), format="jpeg")
+
+    # Still too large — downscale while preserving aspect ratio
+    scale = 0.75
+    while scale >= 0.25:
+        w, h = img.size
+        resized = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        buf = io.BytesIO()
+        resized.save(buf, format="JPEG", quality=70)
+        if buf.tell() <= _MCP_MAX_IMAGE_BYTES:
+            log.info(f"Image downscaled to {resized.size} to fit MCP limit")
+            return MCPImage(data=buf.getvalue(), format="jpeg")
+        scale -= 0.1
+
+    # Last resort: whatever we have
+    return MCPImage(data=buf.getvalue(), format="jpeg")
 
 
 def _extract_best_image(result: dict, workflow: dict) -> MCPImage:
