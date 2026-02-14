@@ -997,12 +997,25 @@ class ComfyClient:
 
             # Post workflow to ComfyUI
             log.info("[cyan]Executing workflow via API...[/cyan]")
-            
-            # Queue the prompt using direct API endpoint
+
+            # Queue the prompt — include workflow in extra_pnginfo so SaveImage
+            # embeds it into the output PNG metadata. Normally ComfyUI stores
+            # both UI-format "workflow" (for drag-and-drop) and API-format
+            # "prompt" (for reference). Headless execution only has API format,
+            # but embedding it preserves full provenance of the generation.
             ret = await self._make_request(
-                "POST", 
-                "/prompt", 
-                {"prompt": workflow, "client_id": self.client_id}
+                "POST",
+                "/prompt",
+                {
+                    "prompt": workflow,
+                    "client_id": self.client_id,
+                    "extra_data": {
+                        "extra_pnginfo": {
+                            "workflow": workflow,
+                            "prompt": workflow,
+                        },
+                    },
+                },
             )
             
             if not wait:

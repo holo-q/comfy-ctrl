@@ -933,6 +933,7 @@ async def generate_image(
     cfg: Optional[float] = None,
     width: Optional[int] = None,
     height: Optional[int] = None,
+    aspect_ratio: Optional[str] = None,
     fields: Optional[dict[str, Any]] = None,
 ) -> MCPImage:
     """Generate an image — the single entry point for all ComfyUI generation.
@@ -968,6 +969,9 @@ async def generate_image(
         cfg:              CFG scale (diffusion only).
         width:            Output width.
         height:           Output height.
+        aspect_ratio:     Aspect ratio (e.g. "1:1", "16:9", "9:16", "auto").
+                          Supported by most API providers. Prefer this over
+                          width/height for API routes.
         fields:           Raw workflow field overrides {"node_id.input_name": value}.
 
     Returns the output image.
@@ -982,6 +986,7 @@ async def generate_image(
         k: v for k, v in {
             "negative_prompt": negative_prompt, "seed": seed, "steps": steps,
             "cfg": cfg, "width": width, "height": height,
+            "aspect_ratio": aspect_ratio,
         }.items() if v is not None
     }
 
