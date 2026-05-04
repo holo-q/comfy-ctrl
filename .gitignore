@@ -7,3 +7,4 @@ js/*.js.map
 js/*.d.ts
 *.log
 *.json
+tmp/
