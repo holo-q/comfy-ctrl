@@ -1,27 +1,108 @@
-# Comfy UIAPI
+# comfy-ctrl
 
-UIAPI is an intermediate and frontend plugin which allow communicating with the Comfy webui through server connection. This saves the need to export a workflow.json and instead directly sending a queue command to the frontend. This way, the user can experiment in realtime as they are running some professional industry or rendering software which uses UIAPI / ComfyUI as a backend. There is no way to switch seamlessly between UIAPI and regular server connection - though as of late summer 2023 it was inferior to use the server connection because the server would constantly unload models and start from scratch, and the schema of the workfow json was completely different and much less convenient, losing crucial information for efficient querying of nodes and assigning data dynamically.
+Remote control bridge for [ComfyUI](https://github.com/comfyanonymous/ComfyUI). Drive workflows programmatically from any Python program — or let an LLM agent do it through the built-in MCP server.
 
-## How?
+Three layers in one package:
 
-1. Both the frontend and your program connect to Comfy through websockets.
-2. The UIAPI plugin implements new API routes.
-3. Your program invokes the special API routes.
-4. The UIAPI plugin acts as a repeater and forwards the requests to the UIAPI javascript plugin running in the webui page.
-5. The request is handled, and a response is posted
-6. The UIAPI acts as a repeater again, this time forwarding to all the other connections
-7. Your program handles the response and unlocks program execution
+| Layer | What it does |
+|-------|-------------|
+| **Server extension** | Registers `/uiapi/*` HTTP routes on ComfyUI's PromptServer, relays commands to the browser frontend via WebSocket |
+| **Python client** | `ComfyClient` — sync and async API for connecting to ComfyUI, manipulating fields, executing workflows, downloading models |
+| **MCP server** | Exposes ComfyUI image generation as tools for Claude Code, Cursor, and other MCP-compatible agents |
 
-## Support Calls
-
-* `comfy.connect(path1, path2)` between inputs and outputs of nodes
-* `comfy.set(path, value)` Set values on widgets (numbers and strings)
-* `comfy.execute()` Queue / execute workflow and receive the output image (detected on a list of common Save Image components)
-
-## Downloads
-
-Since it's typical to run ComfyUI on a server and connect to it locally, routing features are provided to download the missing models. To use it,
+## How it works
 
 ```
-TODO
+Your program ──HTTP──▶ ComfyUI server (comfy-ctrl routes) ──WS──▶ Browser frontend
+                                                           ◀──WS── (response relayed back)
 ```
+
+comfy-ctrl is a relay: it forwards commands from your program to the ComfyUI web UI running in a browser tab, then returns the response. This lets you manipulate the live workflow without exporting/importing JSON.
+
+## Install
+
+### As a ComfyUI extension
+
+Clone into your ComfyUI `custom_nodes/` directory:
+
+```bash
+git clone https://github.com/holo-q/comfy-ctrl custom_nodes/comfy-ctrl
+```
+
+### MCP server
+
+```bash
+uvx --from /path/to/comfy-ctrl comfy-ctrl-mcp
+```
+
+Or install into Claude Code / Claude Desktop via the one-click installer in the ComfyUI web UI (Settings → comfy-ctrl → Install MCP).
+
+## Client usage
+
+```python
+from comfy_client import ComfyClient
+
+client = ComfyClient("http://localhost:8188")
+client.connect_webui()
+
+# Set fields by node_name.widget_name path
+client.set("ksampler.seed", 42)
+client.set("prompt.text", "a cat in space")
+
+# Wire nodes together
+client.connect("model_loader.MODEL", "ksampler.model")
+
+# Execute and get output images (numpy arrays)
+images = client.execute()
+```
+
+### Async
+
+Every method has an async variant:
+
+```python
+await client.set_async("prompt.text", "a cat in space")
+images = await client.execute_async()
+```
+
+### Model downloads
+
+Orchestrate model downloads on a remote ComfyUI server:
+
+```python
+from model_defs import ModelDef, LoraDef
+
+client.download_models([
+    ModelDef("sd_xl_base_1.0.safetensors", civitai="https://civitai.com/models/..."),
+    LoraDef("detail_tweaker_xl.safetensors", huggingface="org/repo/file.safetensors"),
+])
+```
+
+Supports CivitAI, HuggingFace, and Google Drive sources.
+
+## MCP tools
+
+When running as an MCP server, comfy-ctrl exposes:
+
+- **generate_image** — auto-discovers installed API providers (Gemini, OpenAI, Flux, Stability, etc.) and builds workflows dynamically
+- **execute** — run the current browser-loaded workflow
+- **execute_workflow** — run arbitrary API-format workflows with field overrides
+
+## Project structure
+
+```
+comfy_client.py     Python client library (ComfyClient)
+uiapi.py            Server extension — HTTP routes, WebSocket relay
+mcp_server.py       MCP server wrapping the client for LLM agents
+model_defs.py       Model definition dataclasses + download orchestration
+civitai.py          CivitAI API client
+__init__.py         ComfyUI plugin entry point
+js/                 Browser-side frontend extension
+  services/         WebSocket connection, API handlers, download manager
+  components/       UI dialogs (download, workflow, MCP install)
+  utils/            Node graph utilities
+```
+
+## License
+
+MIT
