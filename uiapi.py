@@ -1417,7 +1417,7 @@ async def uiapi_install_mcp(request):
         # The MCP server entry we want to install
         mcp_entry = {
             "command": "uvx",
-            "args": ["--from", plugin_path, "comfyui-mcp-uiapi"],
+            "args": ["--from", plugin_path, "comfy-ctrl-mcp"],
             "env": {"COMFYUI_ADDRESS": comfyui_address},
         }
 

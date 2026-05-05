@@ -1,8 +1,9 @@
 [project]
-name = "comfyui-mcp-uiapi"
+name = "comfy-ctrl"
 version = "0.1.0"
-description = "MCP server for controlling ComfyUI through the uiapi extension"
+description = "Remote control bridge for ComfyUI — server extension, Python client, and MCP server"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "mcp[cli]>=1.0.0",
@@ -18,7 +19,7 @@ dependencies = [
 ]
 
 [project.scripts]
-comfyui-mcp-uiapi = "mcp_server:main"
+comfy-ctrl-mcp = "mcp_server:main"
 
 [build-system]
 requires = ["hatchling"]
