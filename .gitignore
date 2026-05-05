@@ -1,10 +1,13 @@
-__pycache__/**
+__pycache__/
+*.pyc
+.venv/
 node_modules/
 dist/
 outputs/
+tmp/
+*.log
+
+# TS compiled output (source .ts files are canonical)
 js/*.js
 js/*.js.map
 js/*.d.ts
-*.log
-*.json
-tmp/
